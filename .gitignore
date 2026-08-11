@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (API keys 등 — GitHub에 올리지 않음)
+.env
+.env.*
+!.env.example
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
