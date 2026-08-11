@@ -177,6 +177,72 @@ input {
   transform: scale(0.97);
 }
 
+/* 계산된 명식 미리보기 */
+.chart-preview {
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--parchment);
+  border: 1px solid var(--hairline);
+}
+
+.chart-preview-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--primary);
+}
+
+.chart-age {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.pillar-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.pillar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 4px;
+  border-radius: 12px;
+  background: var(--canvas);
+  border: 1px solid var(--hairline);
+}
+
+.pillar span {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.pillar strong {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.chart-elements {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.result-pillars {
+  margin-top: 4px !important;
+  font-weight: 500;
+  color: var(--ink) !important;
+}
+
 /* CTA */
 .btn-row {
   display: grid;

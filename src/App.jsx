@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { buildSajuFromInput, calcManAge } from './saju'
 import './App.css'
 
 // 모델이 붙이는 **, ***, # 같은 마크다운 기호 정리
@@ -55,70 +56,12 @@ function getMissingFields({ name, birthDate, birthTime, gender }) {
   return missing
 }
 
-// 공통 사주 차트 정보
-function buildChartBlock({ name, birthDate, birthTime, gender, calendar }) {
-  const genderLabel =
-    gender === 'male' ? 'male' : gender === 'female' ? 'female' : '(미입력)'
-  const calendarLabel = calendar === 'lunar' ? '음력' : '양력'
-
-  return `이름: ${name || '(미입력)'}
-생년월일: ${birthDate || '(미입력)'}
-출생 시간: ${birthTime || '(미입력)'}
-달력: ${calendarLabel}
-성별: ${genderLabel}
-나이: 만 27세
-
-년주는 기묘, 월주는 기사, 일주는 을축, 시주는 을유
-오행 분포: 금1 목3 수0 화1 토3
-십신(천간): 편재 | 편재 | 일주 | 비견
-십신(지지): 비견 | 상관 | 편재 | 편관
-지장간: 甲 겁재,乙 비견 | 戊 정재,庚 정관,丙 상관 | 癸 편인,辛 편관,己 편재 | 庚 정관,辛 편관
-납음: 성두토 | 대림목 | 해중금 | 천중수
-십이운성: 건록 | 목욕 | 쇠 | 절
-12신살: 재살 | 역마살 | 월살 | 재살
-旬/공망: [년]申酉 [일]戌亥
-월령: 庚
-대운수: 2
-세운: 2021: 신축
-2022: 임인
-2023: 계묘
-2024: 갑진
-2025: 을사
-2026: 병오 (기준)
-2027: 정미
-2028: 무신
-2029: 기유
-2030: 경술
-2031: 신해
-2032: 임자
-월운: 01월: 기축
-02월: 경인
-03월: 신묘
-04월: 임진
-05월: 계사
-06월: 갑오
-07월: 을미
-08월: 병신
-09월: 정유
-10월: 무술
-11월: 기해
-12월: 경자
-대운 1: 무진 2001 (2~11세)
-대운 2: 정묘 2011 (12~21세)
-대운 3: 병인 2021 (22~31세)
-대운 4: 을축 2031 (32~41세)
-대운 5: 갑자 2041 (42~51세)
-대운 6: 계해 2051 (52~61세)
-대운 7: 임술 2061 (62~71세)
-대운 8: 신유 2071 (72~81세)
-대운 9: 경신 2081 (82~91세)`
-}
-
 const FORMAT_RULES = `작성 규칙:
 - 반드시 한국어로만 작성한다.
 - 마크다운을 쓰지 않는다. 별표(*), 해시(#), 백틱, 밑줄로 강조하지 않는다.
 - 제목은 숫자와 점으로만 쓴다. 예: 1. 성격과 기질
-- 문단은 평문만 사용하고, 기호 장식은 최소화한다.`
+- 문단은 평문만 사용하고, 기호 장식은 최소화한다.
+- 제공된 명식 데이터만 사용한다. 다른 사람의 샘플 사주를 끌어오지 않는다.`
 
 function App() {
   // 각 입력값을 저장하는 상태
@@ -136,6 +79,21 @@ function App() {
   const [resultTitle, setResultTitle] = useState('사주 해석')
   const [progress, setProgress] = useState(0) // 로딩 바 0~100
   const [shareMessage, setShareMessage] = useState('') // 공유 성공/실패 안내
+  const [chartDisplay, setChartDisplay] = useState(null) // 계산된 명식 요약
+
+  // 입력만 채워지면 미리 만 나이·사주 미리보기
+  const liveManAge = useMemo(() => calcManAge(birthDate), [birthDate])
+  const liveChart = useMemo(() => {
+    if (!birthDate || !birthTime) return null
+    const built = buildSajuFromInput({
+      name,
+      birthDate,
+      birthTime,
+      gender,
+      calendar,
+    })
+    return built.ok ? built.display : null
+  }, [name, birthDate, birthTime, gender, calendar])
 
   // 로딩 중일 때 게이지가 서서히 차오름 (실제 API 완료 전 최대 90%)
   useEffect(() => {
@@ -163,12 +121,28 @@ function App() {
       return
     }
 
+    // 입력 기반 사주 명식 계산
+    const chartResult = buildSajuFromInput({
+      name,
+      birthDate,
+      birthTime,
+      gender,
+      calendar,
+    })
+    if (!chartResult.ok) {
+      setError(chartResult.error)
+      setResult('')
+      setChartDisplay(null)
+      return
+    }
+
     setLoading(true)
     setLoadingKind(kind)
     setError('')
     setResult('')
     setProgress(0)
     setShareMessage('')
+    setChartDisplay(chartResult.display)
     setResultTitle(kind === 'love' ? '연애운' : '사주 해석')
 
     try {
@@ -177,13 +151,7 @@ function App() {
         throw new Error('VITE_GEMINI_API_KEY가 설정되지 않았습니다.')
       }
 
-      const chart = buildChartBlock({
-        name,
-        birthDate,
-        birthTime,
-        gender,
-        calendar,
-      })
+      const chart = chartResult.chartText
 
       const overallPrompt = `당신은 세계 최고의 사주 해석 전문가다. 논리와 구조 중심으로 사주를 해석하며, 수천 명의 인생을 분석해 온 경험이 있다. 분석은 매우 냉정하고 직설적으로 진행되며, 감정에 휘둘리지 않는다. 그러나 예외로 인간 내면에 대한 깊은 통찰을 지니고 있고 장점과 단점을 냉정하게 말한다.
 
@@ -200,7 +168,7 @@ ${FORMAT_RULES}
 5. 종합 한 줄
 6. 사용자가 더 궁금할 수 있는 질문 하나
 
-판단 근거는 제공된 모든 정보와 해석 가능한 사주 정보를 종합하고, 긍정·부정 해석을 모두 담아 주세요.
+판단 근거는 제공된 모든 정보와 계산된 사주 명식만 사용하세요. 긍정·부정 해석을 모두 담아 주세요.
 
 ${chart}`
 
@@ -272,19 +240,29 @@ ${chart}`
   const handleShareResult = async () => {
     if (!result) return
 
-    const metaLine = [name && `${name}님`, birthDate, birthTime]
+    const metaLine = [
+      name && `${name}님`,
+      birthDate,
+      birthTime,
+      chartDisplay?.manAge != null && `만 ${chartDisplay.manAge}세`,
+    ]
       .filter(Boolean)
       .join(' · ')
+
+    const chartLine = chartDisplay
+      ? `명식 시${chartDisplay.hourPillar} 일${chartDisplay.dayPillar} 월${chartDisplay.monthPillar} 년${chartDisplay.yearPillar}`
+      : ''
 
     const shareText = [
       `[Saju Me] ${resultTitle}`,
       metaLine,
+      chartLine,
       '',
       result,
       '',
       '— Saju Me에서 확인',
     ]
-      .filter((line) => line !== undefined)
+      .filter((line) => line !== undefined && line !== '')
       .join('\n')
 
     try {
@@ -322,6 +300,8 @@ ${chart}`
       setShareMessage('공유에 실패했어요. 다시 시도해 주세요.')
     }
   }
+
+  const shownChart = chartDisplay || liveChart
 
   return (
     <div className="page">
@@ -424,6 +404,42 @@ ${chart}`
             </div>
           </div>
 
+          {(liveManAge != null || shownChart) && (
+            <div className="chart-preview" aria-live="polite">
+              <p className="chart-preview-title">나의 명식</p>
+              {liveManAge != null && (
+                <p className="chart-age">만 {liveManAge}세</p>
+              )}
+              {shownChart && (
+                <>
+                  <div className="pillar-row">
+                    <div className="pillar">
+                      <span>시주</span>
+                      <strong>{shownChart.hourPillar}</strong>
+                    </div>
+                    <div className="pillar">
+                      <span>일주</span>
+                      <strong>{shownChart.dayPillar}</strong>
+                    </div>
+                    <div className="pillar">
+                      <span>월주</span>
+                      <strong>{shownChart.monthPillar}</strong>
+                    </div>
+                    <div className="pillar">
+                      <span>년주</span>
+                      <strong>{shownChart.yearPillar}</strong>
+                    </div>
+                  </div>
+                  {shownChart.fiveElements && (
+                    <p className="chart-elements">
+                      오행 {shownChart.fiveElements}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           <div className="btn-row">
             <button
               type="button"
@@ -484,9 +500,25 @@ ${chart}`
                   <h2>{resultTitle}</h2>
                   {(name || birthDate) && (
                     <p className="result-meta">
-                      {[name && `${name}님`, birthDate, birthTime]
+                      {[
+                        name && `${name}님`,
+                        birthDate,
+                        birthTime,
+                        shownChart?.manAge != null &&
+                          `만 ${shownChart.manAge}세`,
+                      ]
                         .filter(Boolean)
                         .join(' · ')}
+                    </p>
+                  )}
+                  {shownChart && (
+                    <p className="result-meta result-pillars">
+                      {[
+                        `시 ${shownChart.hourPillar}`,
+                        `일 ${shownChart.dayPillar}`,
+                        `월 ${shownChart.monthPillar}`,
+                        `년 ${shownChart.yearPillar}`,
+                      ].join(' · ')}
                     </p>
                   )}
                 </div>
