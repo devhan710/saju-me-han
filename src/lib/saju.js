@@ -1,8 +1,5 @@
 import { calculateSaju } from 'ssaju'
 
-/**
- * 생년월일 문자열(YYYY-MM-DD)로 만 나이 계산
- */
 export function calcManAge(birthDate) {
   if (!birthDate) return null
   const [y, m, d] = birthDate.split('-').map(Number)
@@ -18,10 +15,6 @@ export function calcManAge(birthDate) {
   return age >= 0 ? age : null
 }
 
-/**
- * 폼 입력 → 사주 계산 결과
- * @returns {{ ok: true, chartText: string, manAge: number|null, display: object } | { ok: false, error: string }}
- */
 export function buildSajuFromInput({
   name,
   birthDate,
@@ -62,7 +55,6 @@ export function buildSajuFromInput({
     const calendarLabel = calendar === 'lunar' ? '음력' : '양력'
     const ageText = manAge ?? result.currentAge ?? '?'
 
-    // LLM 프롬프트용: 계산된 명식만 근거로 쓰라고 명시
     const chartText = [
       `이름: ${name?.trim() || '(미입력)'}`,
       `생년월일: ${birthDate}`,
