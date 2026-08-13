@@ -1,6 +1,136 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import mascot from './assets/tree.png'
+import { getUserLabel, signInWithGoogle, signOut } from './auth'
 import { buildSajuFromInput, calcManAge } from './saju'
+import { supabase } from './supabaseClient'
 import './App.css'
+
+function formatBirthTime(value) {
+  if (!value) return ''
+  return String(value).slice(0, 5)
+}
+
+const READING_COLUMNS =
+  'id, name, birth_date, birth_time, gender, calendar, result_kind, result_title, result_text, chart, created_at'
+
+async function fetchReadings() {
+  const { data, error } = await supabase
+    .from('saju_readings')
+    .select(READING_COLUMNS)
+    .order('created_at', { ascending: false })
+
+  if (error) throw error
+  return data ?? []
+}
+
+async function createReading(payload, userId) {
+  const { data, error } = await supabase
+    .from('saju_readings')
+    .insert({ ...payload, user_id: userId })
+    .select(READING_COLUMNS)
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+async function updateReading(id, payload) {
+  const { data, error } = await supabase
+    .from('saju_readings')
+    .update(payload)
+    .eq('id', id)
+    .select(READING_COLUMNS)
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+async function deleteReading(id) {
+  const { error } = await supabase.from('saju_readings').delete().eq('id', id)
+  if (error) throw error
+}
+
+const PROFILE_COLUMNS = 'id, name, birth_date, birth_time, gender, calendar'
+
+async function fetchProfile() {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select(PROFILE_COLUMNS)
+    .maybeSingle()
+
+  if (error) throw error
+  return data
+}
+
+async function upsertProfile(userId, { name, birthDate, birthTime, gender, calendar }) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .upsert({
+      id: userId,
+      name: name.trim(),
+      birth_date: birthDate,
+      birth_time: birthTime,
+      gender,
+      calendar,
+      updated_at: new Date().toISOString(),
+    })
+    .select(PROFILE_COLUMNS)
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+function isSameAsProfile(profile, fields) {
+  if (!profile) return false
+  return (
+    fields.name.trim() === (profile.name ?? '').trim() &&
+    fields.birthDate === (profile.birth_date ?? '') &&
+    formatBirthTime(fields.birthTime) === formatBirthTime(profile.birth_time) &&
+    fields.gender === (profile.gender ?? '') &&
+    fields.calendar === (profile.calendar ?? 'solar')
+  )
+}
+
+function shouldUpdateProfile(profile, nameValue) {
+  if (!profile?.name) return true
+  return nameValue.trim() === profile.name.trim()
+}
+
+function buildReadingPayload({
+  name,
+  birthDate,
+  birthTime,
+  gender,
+  calendar,
+  kind,
+  resultText,
+  chart,
+}) {
+  return {
+    name: name.trim(),
+    birth_date: birthDate,
+    birth_time: birthTime,
+    gender,
+    calendar,
+    result_kind: kind,
+    result_title: kind === 'love' ? '연애운' : '사주 해석',
+    result_text: resultText,
+    chart,
+  }
+}
+
+function buildMetadataPayload({ name, birthDate, birthTime, gender, calendar, chart }) {
+  return {
+    name: name.trim(),
+    birth_date: birthDate,
+    birth_time: birthTime,
+    gender,
+    calendar,
+    chart,
+  }
+}
 
 // 모델이 붙이는 **, ***, # 같은 마크다운 기호 정리
 function cleanResultText(text) {
@@ -56,6 +186,84 @@ function getMissingFields({ name, birthDate, birthTime, gender }) {
   return missing
 }
 
+// Gemini 에러 메시지 → 사람이 읽기 쉬운 한국어
+function formatGeminiError(message) {
+  const raw = message || 'Gemini API 요청에 실패했습니다.'
+  const lower = raw.toLowerCase()
+
+  if (
+    lower.includes('exceeded your current quota') ||
+    lower.includes('rate limit') ||
+    lower.includes('resource_exhausted')
+  ) {
+    const waitMatch = raw.match(/retry in ([\d.]+)\s*s/i)
+    const waitSec = waitMatch ? Math.ceil(Number(waitMatch[1])) : null
+    if (waitSec) {
+      return `요청이 많아서 잠시 쉬고 있어요. 약 ${waitSec}초 뒤에 다시 읽어 볼게요.`
+    }
+    return '요청이 많아서 잠시 쉬고 있어요. 조금 뒤에 다시 시도해 주세요.'
+  }
+
+  if (lower.includes('api key') || lower.includes('permission')) {
+    return 'API 키를 확인해주세요. .env의 VITE_GEMINI_API_KEY를 점검해 주세요.'
+  }
+
+  return raw
+}
+
+// generateContent 호출 (할당량 초과 시 1회 대기 후 재시도)
+async function callGemini(apiKey, prompt, { onRetryWait } = {}) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+  })
+
+  const requestOnce = async () => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    const data = await response.json()
+    return { response, data }
+  }
+
+  let { response, data } = await requestOnce()
+
+  if (!response.ok) {
+    const msg = data.error?.message || 'Gemini API 요청에 실패했습니다.'
+    const waitMatch = msg.match(/retry in ([\d.]+)\s*s/i)
+    const isQuota =
+      /quota|rate limit|resource_exhausted/i.test(msg) && waitMatch
+
+    // 서버가 알려준 대기 시간만큼 쉬고 한 번 더 시도
+    if (isQuota) {
+      const waitMs = Math.ceil(Number(waitMatch[1]) * 1000) + 500
+      if (onRetryWait) onRetryWait(Math.ceil(waitMs / 1000))
+      await new Promise((resolve) => setTimeout(resolve, waitMs))
+      ;({ response, data } = await requestOnce())
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      formatGeminiError(data.error?.message || 'Gemini API 요청에 실패했습니다.')
+    )
+  }
+
+  const text =
+    data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text)
+      .filter(Boolean)
+      .join('') || ''
+
+  if (!text) {
+    throw new Error('모델 응답이 비어 있습니다.')
+  }
+
+  return text
+}
+
 const FORMAT_RULES = `작성 규칙:
 - 반드시 한국어로만 작성한다.
 - 마크다운을 쓰지 않는다. 별표(*), 해시(#), 백틱, 밑줄로 강조하지 않는다.
@@ -78,8 +286,57 @@ function App() {
   const [result, setResult] = useState('')
   const [resultTitle, setResultTitle] = useState('사주 해석')
   const [progress, setProgress] = useState(0) // 로딩 바 0~100
-  const [shareMessage, setShareMessage] = useState('') // 공유 성공/실패 안내
+  const [toast, setToast] = useState(null)
   const [chartDisplay, setChartDisplay] = useState(null) // 계산된 명식 요약
+  const [readings, setReadings] = useState([])
+  const [selectedReadingId, setSelectedReadingId] = useState(null)
+  const [readingsError, setReadingsError] = useState('')
+  const [formCollapsed, setFormCollapsed] = useState(false)
+  const [deletingId, setDeletingId] = useState(null)
+  const [savingMetadata, setSavingMetadata] = useState(false)
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authError, setAuthError] = useState('')
+  const [profile, setProfile] = useState(null)
+  const [savingProfile, setSavingProfile] = useState(false)
+  const nameInputRef = useRef(null)
+  const resultRef = useRef(null)
+  const selectedReadingIdRef = useRef(null)
+  const toastTimerRef = useRef(null)
+  selectedReadingIdRef.current = selectedReadingId
+
+  const userLabel = useMemo(() => getUserLabel(user), [user])
+
+  const selectedReading = useMemo(
+    () => readings.find((row) => row.id === selectedReadingId) ?? null,
+    [readings, selectedReadingId],
+  )
+
+  const missingFields = useMemo(
+    () => getMissingFields({ name, birthDate, birthTime, gender }),
+    [name, birthDate, birthTime, gender],
+  )
+  const formReady = missingFields.length === 0
+
+  const hasMetadataChanges = useMemo(() => {
+    if (!selectedReading) return false
+    return (
+      name.trim() !== (selectedReading.name ?? '').trim() ||
+      birthDate !== (selectedReading.birth_date ?? '') ||
+      formatBirthTime(birthTime) !== formatBirthTime(selectedReading.birth_time) ||
+      gender !== (selectedReading.gender ?? '') ||
+      calendar !== (selectedReading.calendar ?? 'solar')
+    )
+  }, [selectedReading, name, birthDate, birthTime, gender, calendar])
+
+  const formFields = useMemo(
+    () => ({ name, birthDate, birthTime, gender, calendar }),
+    [name, birthDate, birthTime, gender, calendar],
+  )
+  const matchesProfile = isSameAsProfile(profile, formFields)
+  const hasSavedProfile = Boolean(
+    profile?.name && profile?.birth_date && profile?.birth_time && profile?.gender,
+  )
 
   // 입력만 채워지면 미리 만 나이·사주 미리보기
   const liveManAge = useMemo(() => calcManAge(birthDate), [birthDate])
@@ -94,6 +351,110 @@ function App() {
     })
     return built.ok ? built.display : null
   }, [name, birthDate, birthTime, gender, calendar])
+
+  const applyProfileToForm = (nextProfile) => {
+    if (!nextProfile) return
+    setName(nextProfile.name ?? '')
+    setBirthDate(nextProfile.birth_date ?? '')
+    setBirthTime(formatBirthTime(nextProfile.birth_time))
+    setGender(nextProfile.gender ?? '')
+    setCalendar(nextProfile.calendar ?? 'solar')
+    setChartDisplay(null)
+  }
+
+  const resetBlankForm = () => {
+    setName('')
+    setBirthDate('')
+    setBirthTime('')
+    setGender('')
+    setCalendar('solar')
+    setChartDisplay(null)
+  }
+
+  useEffect(() => {
+    let mounted = true
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return
+      if (error) {
+        setAuthError(error.message || '로그인 상태를 확인하지 못했어요. 잠시 후 다시 해 볼까요?')
+      } else {
+        setUser(data.session?.user ?? null)
+      }
+      setAuthLoading(false)
+    })
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
+      setAuthError('')
+    })
+
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (authLoading) return
+
+    if (!user) {
+      setReadings([])
+      setProfile(null)
+      setSelectedReadingId(null)
+      setReadingsError('')
+      return
+    }
+
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const [rows, nextProfile] = await Promise.all([
+          fetchReadings(),
+          fetchProfile(),
+        ])
+        if (cancelled) return
+
+        const fallbackProfile =
+          nextProfile ??
+          (rows[0]
+            ? {
+                id: user.id,
+                name: rows[0].name,
+                birth_date: rows[0].birth_date,
+                birth_time: rows[0].birth_time,
+                gender: rows[0].gender,
+                calendar: rows[0].calendar,
+              }
+            : null)
+
+        setReadings(rows)
+        setProfile(fallbackProfile)
+        setReadingsError('')
+        if (!selectedReadingIdRef.current && fallbackProfile) {
+          applyProfileToForm(fallbackProfile)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setReadingsError(err.message || '남겨 둔 해석을 불러오지 못했어요.')
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user, authLoading])
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    }
+  }, [])
 
   // 로딩 중일 때 게이지가 서서히 차오름 (실제 API 완료 전 최대 90%)
   useEffect(() => {
@@ -111,13 +472,245 @@ function App() {
     return () => clearInterval(timer)
   }, [loading])
 
+  const scrollToResult = () => {
+    requestAnimationFrame(() => {
+      resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+
+  const showToast = (message, { type = 'success', action, duration } = {}) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    const next = { id: Date.now(), message, type, action }
+    setToast(next)
+    const ms = duration ?? (action ? 7000 : 2800)
+    toastTimerRef.current = setTimeout(() => {
+      setToast((current) => (current?.id === next.id ? null : current))
+    }, ms)
+  }
+
+  const dismissToast = () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    setToast(null)
+  }
+
+  const handleGoogleSignIn = async () => {
+    setAuthError('')
+    try {
+      await signInWithGoogle()
+    } catch (err) {
+      const message = err.message || '로그인이 잘 안 됐어요. 다시 한 번 해 볼까요?'
+      setAuthError(message)
+      showToast(message, { type: 'error' })
+    }
+  }
+
+  const handleSignOut = async () => {
+    setAuthError('')
+    try {
+      await signOut()
+      setProfile(null)
+      handleNewSaju({ useProfile: false })
+      showToast('다음에 또 만나요.', {
+        action: { label: '다시 만나요', onClick: handleGoogleSignIn },
+      })
+    } catch (err) {
+      const message = err.message || '로그아웃이 잘 안 됐어요. 다시 시도해 주세요.'
+      setAuthError(message)
+      showToast(message, { type: 'error' })
+    }
+  }
+
+  const handleSelectReading = (reading) => {
+    setSelectedReadingId(reading.id)
+    setName(reading.name ?? '')
+    setBirthDate(reading.birth_date ?? '')
+    setBirthTime(formatBirthTime(reading.birth_time))
+    setGender(reading.gender ?? '')
+    setCalendar(reading.calendar ?? 'solar')
+    setResultTitle(reading.result_title || '사주 해석')
+    setResult(reading.result_text || '')
+    setChartDisplay(reading.chart ?? null)
+    setError('')
+    setProgress(0)
+    setFormCollapsed(true)
+    scrollToResult()
+  }
+
+  const handleNewSaju = ({ useProfile = true } = {}) => {
+    setSelectedReadingId(null)
+    if (useProfile && hasSavedProfile) {
+      applyProfileToForm(profile)
+    } else {
+      resetBlankForm()
+    }
+    setResult('')
+    setResultTitle('사주 해석')
+    setError('')
+    setProgress(0)
+    setLoading(false)
+    setLoadingKind('')
+    setFormCollapsed(false)
+    requestAnimationFrame(() => {
+      if (useProfile && hasSavedProfile) return
+      nameInputRef.current?.focus()
+    })
+  }
+
+  const maybeSaveProfile = async () => {
+    if (!user || !formReady) return null
+    if (!shouldUpdateProfile(profile, name)) return profile
+
+    try {
+      const saved = await upsertProfile(user.id, formFields)
+      setProfile(saved)
+      return saved
+    } catch {
+      return profile
+    }
+  }
+
+  const handleSaveAsMyProfile = async () => {
+    if (!user || !formReady) return
+
+    setSavingProfile(true)
+    setError('')
+    try {
+      const saved = await upsertProfile(user.id, formFields)
+      setProfile(saved)
+      showToast('기본 정보를 기억해 둘게요.', {
+        action: {
+          label: '바로 채우기',
+          onClick: () => handleNewSaju(),
+        },
+      })
+    } catch (err) {
+      setError(err.message || '기본 정보를 저장하지 못했어요. 다시 해 볼까요?')
+    } finally {
+      setSavingProfile(false)
+    }
+  }
+
+  const handleDeleteReading = async (readingId, event) => {
+    event.stopPropagation()
+    if (deletingId) return
+
+    const removed = readings.find((row) => row.id === readingId)
+    setDeletingId(readingId)
+    setReadingsError('')
+    try {
+      await deleteReading(readingId)
+      setReadings((prev) => prev.filter((row) => row.id !== readingId))
+      if (selectedReadingId === readingId) {
+        handleNewSaju()
+      }
+      showToast('기록을 치워 두었어요.', {
+        action: removed && user
+          ? {
+              label: '되돌리기',
+              onClick: async () => {
+                try {
+                  const restored = await createReading(
+                    buildReadingPayload({
+                      name: removed.name ?? '',
+                      birthDate: removed.birth_date ?? '',
+                      birthTime: formatBirthTime(removed.birth_time),
+                      gender: removed.gender ?? '',
+                      calendar: removed.calendar ?? 'solar',
+                      kind: removed.result_kind || 'overall',
+                      resultText: removed.result_text || '',
+                      chart: removed.chart ?? null,
+                    }),
+                    user.id,
+                  )
+                  setReadings((prev) => [
+                    restored,
+                    ...prev.filter((row) => row.id !== restored.id),
+                  ])
+                  handleSelectReading(restored)
+                  showToast('다시 꺼내 두었어요.')
+                } catch (undoError) {
+                  showToast(
+                    undoError.message || '되돌리기가 잘 안 됐어요.',
+                    { type: 'error' },
+                  )
+                }
+              },
+            }
+          : undefined,
+      })
+    } catch (err) {
+      const message = err.message || '삭제가 잘 안 됐어요. 다시 시도해 주세요.'
+      setReadingsError(message)
+      showToast(message, { type: 'error' })
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const handleSaveMetadata = async () => {
+    if (!user) {
+      showToast('저장하려면 먼저 로그인해 주세요.', {
+        type: 'error',
+        action: { label: '로그인', onClick: handleGoogleSignIn },
+      })
+      return
+    }
+    if (!selectedReadingId || !formReady || !hasMetadataChanges) return
+
+    const chartResult = buildSajuFromInput({
+      name,
+      birthDate,
+      birthTime,
+      gender,
+      calendar,
+    })
+    if (!chartResult.ok) {
+      setError(chartResult.error)
+      return
+    }
+
+    setSavingMetadata(true)
+    setReadingsError('')
+    setError('')
+    try {
+      const updated = await updateReading(
+        selectedReadingId,
+        buildMetadataPayload({
+          name,
+          birthDate,
+          birthTime,
+          gender,
+          calendar,
+          chart: chartResult.display,
+        }),
+      )
+
+      setChartDisplay(chartResult.display)
+      setReadings((prev) =>
+        prev.map((row) => (row.id === updated.id ? updated : row)),
+      )
+      await maybeSaveProfile()
+      showToast('입력하신 내용을 저장해 두었어요.')
+    } catch (err) {
+      setError(err.message || '입력 내용을 저장하지 못했어요. 다시 해 볼까요?')
+    } finally {
+      setSavingMetadata(false)
+    }
+  }
+
+  const upsertReadingInList = (saved, removedId) => {
+    setSelectedReadingId(saved.id)
+    setReadings((prev) => [
+      saved,
+      ...prev.filter((row) => row.id !== saved.id && row.id !== removedId),
+    ])
+  }
+
   // kind: 'overall' | 'love'
   const handleViewSaju = async (kind = 'overall') => {
-    const missing = getMissingFields({ name, birthDate, birthTime, gender })
-    if (missing.length > 0) {
-      setError(`${missing.join(', ')} 항목을 입력해 주세요.`)
-      setResult('')
-      setProgress(0)
+    if (missingFields.length > 0) {
+      setError(`${missingFields.join(', ')}을(를) 알려 주시면 읽어 볼게요.`)
+      setFormCollapsed(false)
       return
     }
 
@@ -133,15 +726,17 @@ function App() {
       setError(chartResult.error)
       setResult('')
       setChartDisplay(null)
+      setFormCollapsed(false)
       return
     }
+
+    const previousId = selectedReadingId
 
     setLoading(true)
     setLoadingKind(kind)
     setError('')
     setResult('')
     setProgress(0)
-    setShareMessage('')
     setChartDisplay(chartResult.display)
     setResultTitle(kind === 'love' ? '연애운' : '사주 해석')
 
@@ -191,44 +786,53 @@ ${chart}`
 
       const prompt = kind === 'love' ? lovePrompt : overallPrompt
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [{ text: prompt }],
-              },
-            ],
-          }),
-        }
-      )
+      const text = await callGemini(apiKey, prompt, {
+        onRetryWait: (sec) => {
+          setError(`요청이 많아서 잠시 기다리고 있어요. 약 ${sec}초 뒤에 다시 읽어 볼게요.`)
+        },
+      })
 
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error?.message || 'Gemini API 요청에 실패했습니다.')
-      }
-
-      // 응답 텍스트 모으기 (thinking 파트 등 text 없는 파트는 건너뜀)
-      const text =
-        data.candidates?.[0]?.content?.parts
-          ?.map((part) => part.text)
-          .filter(Boolean)
-          .join('') || ''
-
-      if (!text) {
-        throw new Error('모델 응답이 비어 있습니다.')
-      }
-
+      setError('')
       setProgress(100)
       // 100% 채움 애니메이션을 잠깐 보여준 뒤 결과 표시
       await new Promise((resolve) => setTimeout(resolve, 350))
-      setResult(cleanResultText(text))
+      const cleaned = cleanResultText(text)
+      setResult(cleaned)
+      setFormCollapsed(true)
+      scrollToResult()
+
+      const payload = buildReadingPayload({
+        name,
+        birthDate,
+        birthTime,
+        gender,
+        calendar,
+        kind,
+        resultText: cleaned,
+        chart: chartResult.display,
+      })
+
+      if (previousId) {
+        const updated = await updateReading(previousId, payload)
+        upsertReadingInList(updated)
+        await maybeSaveProfile()
+        showToast('해석을 다시 적어 두었어요.', {
+          action: { label: '결과 보기', onClick: scrollToResult },
+        })
+      } else if (user) {
+        const saved = await createReading(payload, user.id)
+        upsertReadingInList(saved)
+        await maybeSaveProfile()
+        showToast('해석을 소중히 저장해 두었어요.', {
+          action: { label: '결과 보기', onClick: scrollToResult },
+        })
+      } else {
+        showToast('로그인하면 이 해석을 남겨 둘 수 있어요.', {
+          action: { label: '로그인', onClick: handleGoogleSignIn },
+        })
+      }
     } catch (err) {
-      setError(err.message || '사주 해석 중 오류가 발생했습니다.')
+      setError(formatGeminiError(err.message) || '해석 중에 문제가 생겼어요. 다시 한 번 해 볼까요?')
       setProgress(0)
     } finally {
       setLoading(false)
@@ -272,14 +876,14 @@ ${chart}`
           title: `Saju Me · ${resultTitle}`,
           text: shareText,
         })
-        setShareMessage('공유를 완료했어요.')
+        showToast('잘 전달됐어요.')
         return
       }
 
       // 데스크톱 등: 클립보드에 복사
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(shareText)
-        setShareMessage('결과 텍스트를 복사했어요. 원하는 곳에 붙여넣기 하세요.')
+        showToast('해석을 복사해 두었어요.')
         return
       }
 
@@ -293,11 +897,11 @@ ${chart}`
       textarea.select()
       document.execCommand('copy')
       document.body.removeChild(textarea)
-      setShareMessage('결과 텍스트를 복사했어요. 원하는 곳에 붙여넣기 하세요.')
+      showToast('해석을 복사해 두었어요.')
     } catch (err) {
       // 사용자가 공유 시트를 닫은 경우는 조용히 무시
       if (err?.name === 'AbortError') return
-      setShareMessage('공유에 실패했어요. 다시 시도해 주세요.')
+      showToast('공유가 잘 안 됐어요. 다시 한 번 해 볼까요?', { type: 'error' })
     }
   }
 
@@ -305,18 +909,172 @@ ${chart}`
 
   return (
     <div className="page">
-      <main className="shell">
+      <div className="layout">
+        <img
+          src={mascot}
+          alt="사주 나무"
+          className="mascot mascot-aside"
+        />
+
+        <aside className="sidebar" aria-label="저장된 사주">
+          <div className="auth-panel">
+            {authLoading ? (
+              <p className="auth-status">잠깐만, 확인하고 있어요…</p>
+            ) : user ? (
+              <>
+                <p className="auth-user">{userLabel}님, 반가워요</p>
+                <button
+                  type="button"
+                  className="auth-btn auth-btn-secondary"
+                  onClick={handleSignOut}
+                  disabled={loading}
+                >
+                  로그아웃
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="auth-status">로그인하면 해석을 남겨 둘 수 있어요.</p>
+                <button
+                  type="button"
+                  className="auth-btn auth-btn-google"
+                  onClick={handleGoogleSignIn}
+                  disabled={loading}
+                >
+                  Google로 로그인
+                </button>
+              </>
+            )}
+            {authError && (
+              <p className="sidebar-error" role="alert">
+                {authError}
+              </p>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className={`sidebar-new ${selectedReadingId == null ? 'is-selected' : ''}`}
+            onClick={handleNewSaju}
+            disabled={loading || !user}
+            title={user ? undefined : '로그인하면 함께 읽어 볼 수 있어요'}
+          >
+            새 사주 만들기
+          </button>
+          <p className="sidebar-title">남겨 둔 해석</p>
+          {!user && !authLoading && (
+            <p className="sidebar-empty">로그인하면 여기 목록이 생겨요.</p>
+          )}
+          {user && readingsError && (
+            <p className="sidebar-error" role="alert">
+              {readingsError}
+            </p>
+          )}
+          {user && !readingsError && readings.length === 0 && (
+            <p className="sidebar-empty">아직 남겨 둔 해석이 없어요. 함께 읽어 볼까요?</p>
+          )}
+          {user && (
+          <ul className="sidebar-list">
+            {readings.map((reading) => (
+              <li key={reading.id} className="sidebar-row">
+                <button
+                  type="button"
+                  className={`sidebar-item ${
+                    selectedReadingId === reading.id ? 'is-selected' : ''
+                  }`}
+                  onClick={() => handleSelectReading(reading)}
+                >
+                  <span className="sidebar-name">{reading.name}</span>
+                  <span className="sidebar-meta">
+                    {reading.result_title ||
+                      (reading.result_kind === 'love' ? '연애운' : '사주 해석')}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="sidebar-delete"
+                  aria-label={`${reading.name} 기록 삭제`}
+                  disabled={deletingId === reading.id || loading}
+                  onClick={(event) => handleDeleteReading(reading.id, event)}
+                >
+                  {deletingId === reading.id ? '…' : '삭제'}
+                </button>
+              </li>
+            ))}
+          </ul>
+          )}
+        </aside>
+
         <header className="hero">
-          <p className="brand">Saju Me</p>
-          <h1>나의 사주</h1>
-          <p className="lede">기본 정보를 입력하고 명식을 읽어 보세요.</p>
+          <img
+            src={mascot}
+            alt=""
+            className="mascot mascot-hero"
+          />
+          <div className="hero-copy">
+            <p className="brand">Saju Me</p>
+            <h1>
+              {selectedReadingId && name.trim()
+                ? `${name.trim()}님의 사주`
+                : '나의 사주'}
+            </h1>
+            <p className="lede">
+              {selectedReadingId
+                ? '남겨 둔 해석을 보고 있어요. 고치고 싶으면 언제든 말씀해 주세요.'
+                : hasSavedProfile
+                  ? '이미 아는 정보로 바로 읽어 볼게요. 다른 분 사주도 괜찮아요.'
+                  : '생년월일만 알려 주시면, 함께 천천히 읽어 볼게요.'}
+            </p>
+          </div>
         </header>
 
+        <main className="shell">
         <section className="form-panel" aria-label="사주 입력">
+          {result && (
+            <button
+              type="button"
+              className="form-toggle"
+              onClick={() => setFormCollapsed((prev) => !prev)}
+            >
+              {formCollapsed ? '입력 수정하기' : '입력 접기'}
+            </button>
+          )}
+
+          {formCollapsed && (
+            <p className="form-summary">
+              {[
+                name && `${name}님`,
+                birthDate,
+                birthTime,
+                gender === 'male'
+                  ? '남성'
+                  : gender === 'female'
+                    ? '여성'
+                    : null,
+                calendar === 'lunar' ? '음력' : '양력',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            </p>
+          )}
+
+          {!formCollapsed && (
+            <>
+          {user && hasSavedProfile && !matchesProfile && (
+            <button
+              type="button"
+              className="form-toggle"
+              onClick={() => applyProfileToForm(profile)}
+            >
+              내 정보로 다시 채우기
+            </button>
+          )}
+
           <div className="field">
             <label htmlFor="name">이름</label>
             <input
               id="name"
+              ref={nameInputRef}
               type="text"
               placeholder="예: 홍길동"
               value={name}
@@ -445,23 +1203,65 @@ ${chart}`
               type="button"
               className="btn-primary"
               onClick={() => handleViewSaju('overall')}
-              disabled={loading}
+              disabled={loading || savingMetadata || savingProfile || !formReady}
+              title={
+                formReady
+                  ? undefined
+                  : `${missingFields.join(', ')}을(를) 입력해 주세요`
+              }
             >
               {loading && loadingKind === 'overall'
-                ? '🔮 풀이 중...'
-                : '내 사주 보기'}
+                ? '읽는 중...'
+                : selectedReadingId
+                  ? '사주 다시 읽기'
+                  : '내 사주 읽어 보기'}
             </button>
             <button
               type="button"
               className="btn-secondary"
               onClick={() => handleViewSaju('love')}
-              disabled={loading}
+              disabled={loading || savingMetadata || savingProfile || !formReady}
+              title={
+                formReady
+                  ? undefined
+                  : `${missingFields.join(', ')}을(를) 입력해 주세요`
+              }
             >
               {loading && loadingKind === 'love'
-                ? '🔮 풀이 중...'
-                : '연애운 보기'}
+                ? '읽는 중...'
+                : selectedReadingId
+                  ? '연애운 다시 읽기'
+                  : '연애운 읽어 보기'}
             </button>
           </div>
+
+          {selectedReadingId && hasMetadataChanges && (
+            <button
+              type="button"
+              className="btn-save-meta"
+              onClick={handleSaveMetadata}
+              disabled={loading || savingMetadata || savingProfile || !formReady}
+            >
+              {savingMetadata ? '적어 두는 중…' : '입력 정보만 저장'}
+            </button>
+          )}
+
+          {user && formReady && !matchesProfile && (
+            <button
+              type="button"
+              className="btn-save-meta"
+              onClick={handleSaveAsMyProfile}
+              disabled={loading || savingMetadata || savingProfile}
+            >
+              {savingProfile ? '기억해 두는 중…' : '내 기본 정보로 기억하기'}
+            </button>
+          )}
+
+          {!formReady && !loading && (
+            <p className="form-hint">
+              {missingFields.join(', ')}만 알려 주시면 바로 읽어 볼게요.
+            </p>
+          )}
 
           {(loading || progress > 0) && (
             <div
@@ -480,19 +1280,25 @@ ${chart}`
               </div>
               <p className="progress-label">
                 {loading
-                  ? `명식을 읽는 중… ${Math.round(progress)}%`
+                  ? `명식을 천천히 읽고 있어요… ${Math.round(progress)}%`
                   : progress === 100
-                    ? '풀이 완료'
+                    ? '다 읽어 보았어요'
                     : null}
               </p>
             </div>
           )}
 
           {error && <p className="error" role="alert">{error}</p>}
+            </>
+          )}
+
+          {formCollapsed && error && (
+            <p className="error" role="alert">{error}</p>
+          )}
         </section>
 
         {result && (
-          <section className="result" aria-live="polite">
+          <section className="result" aria-live="polite" ref={resultRef}>
             <div className="result-header">
               <div className="result-header-row">
                 <div>
@@ -522,13 +1328,25 @@ ${chart}`
                     </p>
                   )}
                 </div>
-                <button
-                  type="button"
-                  className="btn-share"
-                  onClick={handleShareResult}
-                >
-                  결과 공유
-                </button>
+                <div className="result-actions">
+                  <button
+                    type="button"
+                    className="btn-share"
+                    onClick={() => {
+                      setFormCollapsed(false)
+                      requestAnimationFrame(() => nameInputRef.current?.focus())
+                    }}
+                  >
+                    입력 고치기
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-share"
+                    onClick={handleShareResult}
+                  >
+                    결과 나누기
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -552,14 +1370,42 @@ ${chart}`
               ))}
             </div>
 
-            {shareMessage && (
-              <p className="share-message" role="status">
-                {shareMessage}
-              </p>
-            )}
           </section>
         )}
       </main>
+      </div>
+
+      {toast && (
+        <div
+          className={`toast toast-${toast.type}`}
+          role="status"
+          aria-live="polite"
+        >
+          <img src={mascot} alt="" className="toast-mascot" />
+          <p className="toast-message">{toast.message}</p>
+          {toast.action && (
+            <button
+              type="button"
+              className="toast-action"
+              onClick={async () => {
+                const action = toast.action
+                dismissToast()
+                await action.onClick()
+              }}
+            >
+              {toast.action.label}
+            </button>
+          )}
+          <button
+            type="button"
+            className="toast-close"
+            aria-label="닫기"
+            onClick={dismissToast}
+          >
+            ×
+          </button>
+        </div>
+      )}
     </div>
   )
 }
